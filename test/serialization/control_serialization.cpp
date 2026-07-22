@@ -11,6 +11,8 @@
 #include <libcamera/control_ids.h>
 #include <libcamera/controls.h>
 
+#include <libcamera/ipa/ipa_controls.h>
+
 #include "libcamera/internal/byte_stream_buffer.h"
 #include "libcamera/internal/control_serializer.h"
 
@@ -166,6 +168,113 @@ protected:
 
 		if (!equals(list, newList)) {
 			cerr << "Deserialized list doesn't match original" << endl;
+			return TestFail;
+		}
+
+		/* Build a local (V4L2-like) ControlInfoMap and verify name round-trip. */
+		vector<unique_ptr<ControlId>> v4l2ControlIds;
+		ControlIdMap v4l2IdMap;
+		constexpr uint32_t kV4L2TestControlId = 0x009a2001;
+		const string kV4L2ControlName = "V4L2_CID_TEST_GAIN";
+
+		v4l2ControlIds.emplace_back(std::make_unique<ControlId>(
+			kV4L2TestControlId, kV4L2ControlName, "v4l2",
+			ControlTypeInteger32, ControlId::Direction::In));
+		v4l2IdMap.emplace(kV4L2TestControlId, v4l2ControlIds.back().get());
+
+		ControlInfoMap::Map v4l2Info;
+		v4l2Info.emplace(v4l2ControlIds.back().get(),
+				 ControlInfo(ControlValue(int32_t{ 0 }),
+					     ControlValue(int32_t{ 255 }),
+					     ControlValue(int32_t{ 16 })));
+		ControlInfoMap v4l2InfoMap(std::move(v4l2Info), v4l2IdMap);
+
+		ControlSerializer v4l2Serializer(ControlSerializer::Role::Proxy);
+		ControlSerializer v4l2Deserializer(ControlSerializer::Role::Worker);
+
+		size = v4l2Serializer.binarySize(v4l2InfoMap);
+		infoData.resize(size);
+		buffer = ByteStreamBuffer(infoData.data(), infoData.size());
+
+		ret = v4l2Serializer.serialize(v4l2InfoMap, buffer);
+		if (ret < 0 || buffer.overflow()) {
+			cerr << "Failed to serialize V4L2-like ControlInfoMap" << endl;
+			return TestFail;
+		}
+
+		buffer = ByteStreamBuffer(const_cast<const uint8_t *>(infoData.data()),
+					  infoData.size());
+		ControlInfoMap v4l2InfoMapDes =
+			v4l2Deserializer.deserialize<ControlInfoMap>(buffer);
+		if (v4l2InfoMapDes.empty()) {
+			cerr << "Failed to deserialize V4L2-like ControlInfoMap" << endl;
+			return TestFail;
+		}
+
+		auto idIt = v4l2InfoMapDes.idmap().find(kV4L2TestControlId);
+		if (idIt == v4l2InfoMapDes.idmap().end()) {
+			cerr << "Deserialized V4L2-like id map misses test control" << endl;
+			return TestFail;
+		}
+
+		if (idIt->second->name() != kV4L2ControlName) {
+			cerr << "Deserialized V4L2-like control name doesn't match" << endl;
+			return TestFail;
+		}
+
+		/* Reject malformed packets with over-sized names. */
+		vector<uint8_t> badNameLenData = infoData;
+		auto *badNameLenHeader =
+			reinterpret_cast<ipa_controls_header *>(badNameLenData.data());
+		auto *badNameLenEntry = reinterpret_cast<ipa_control_info_entry *>(
+			badNameLenData.data() + sizeof(*badNameLenHeader));
+		badNameLenEntry->name_len = 2048;
+
+		ControlSerializer badNameLenDeserializer(ControlSerializer::Role::Worker);
+		buffer = ByteStreamBuffer(const_cast<const uint8_t *>(badNameLenData.data()),
+					  badNameLenData.size());
+		if (!badNameLenDeserializer.deserialize<ControlInfoMap>(buffer).empty()) {
+			cerr << "Oversized control name should be rejected" << endl;
+			return TestFail;
+		}
+
+		/* Reject malformed packets with non-null-terminated names. */
+		vector<uint8_t> badTermData = infoData;
+		badTermData.back() = 'X';
+
+		ControlSerializer badTermDeserializer(ControlSerializer::Role::Worker);
+		buffer = ByteStreamBuffer(const_cast<const uint8_t *>(badTermData.data()),
+					  badTermData.size());
+		if (!badTermDeserializer.deserialize<ControlInfoMap>(buffer).empty()) {
+			cerr << "Control name without null terminator should be rejected" << endl;
+			return TestFail;
+		}
+
+		/* Reject too-long names at serialization time. */
+		vector<unique_ptr<ControlId>> longNameControlIds;
+		ControlIdMap longNameIdMap;
+		string longName(1025, 'n');
+
+		longNameControlIds.emplace_back(std::make_unique<ControlId>(
+			0x009a2002, longName, "v4l2", ControlTypeInteger32,
+			ControlId::Direction::In));
+		longNameIdMap.emplace(0x009a2002, longNameControlIds.back().get());
+
+		ControlInfoMap::Map longNameInfo;
+		longNameInfo.emplace(longNameControlIds.back().get(),
+				     ControlInfo(ControlValue(int32_t{ 0 }),
+						 ControlValue(int32_t{ 255 }),
+						 ControlValue(int32_t{ 16 })));
+		ControlInfoMap longNameInfoMap(std::move(longNameInfo), longNameIdMap);
+
+		ControlSerializer longNameSerializer(ControlSerializer::Role::Proxy);
+		size = longNameSerializer.binarySize(longNameInfoMap);
+		infoData.resize(size);
+		buffer = ByteStreamBuffer(infoData.data(), infoData.size());
+
+		ret = longNameSerializer.serialize(longNameInfoMap, buffer);
+		if (ret != -EINVAL) {
+			cerr << "Too-long control name should fail serialization" << endl;
 			return TestFail;
 		}
 

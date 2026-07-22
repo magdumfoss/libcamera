@@ -31,6 +31,27 @@ namespace libcamera {
 
 LOG_DEFINE_CATEGORY(Serializer)
 
+namespace {
+
+constexpr uint32_t kMaxControlNameLength = 1024;
+
+enum ipa_controls_id_map_type idMapTypeFor(const ControlIdMap &idmap)
+{
+	if (&idmap == &controls::controls)
+		return IPA_CONTROL_ID_MAP_CONTROLS;
+	if (&idmap == &properties::properties)
+		return IPA_CONTROL_ID_MAP_PROPERTIES;
+
+	return IPA_CONTROL_ID_MAP_V4L2;
+}
+
+bool idMapRequiresLocalIds(enum ipa_controls_id_map_type idMapType)
+{
+	return idMapType == IPA_CONTROL_ID_MAP_V4L2;
+}
+
+} /* namespace */
+
 /**
  * \class ControlSerializer
  * \brief Serializer and deserializer for control-related classes
@@ -165,9 +186,15 @@ size_t ControlSerializer::binarySize(const ControlInfoMap &infoMap)
 {
 	size_t size = sizeof(struct ipa_controls_header)
 		    + infoMap.size() * sizeof(struct ipa_control_info_entry);
+	enum ipa_controls_id_map_type idMapType = idMapTypeFor(infoMap.idmap());
 
-	for (const auto &ctrl : infoMap)
+	for (const auto &ctrl : infoMap) {
 		size += binarySize(ctrl.second);
+
+		size += idMapRequiresLocalIds(idMapType)
+				? ctrl.first->name().size() + 1
+				: 1;
+	}
 
 	return size;
 }
@@ -183,8 +210,7 @@ size_t ControlSerializer::binarySize(const ControlInfoMap &infoMap)
  */
 size_t ControlSerializer::binarySize(const ControlList &list)
 {
-	size_t size = sizeof(struct ipa_controls_header)
-		    + list.size() * sizeof(struct ipa_control_list_entry);
+	size_t size = sizeof(struct ipa_controls_header) + list.size() * sizeof(struct ipa_control_list_entry);
 
 	for (const auto &ctrl : list)
 		size += binarySize(ctrl.second);
@@ -231,24 +257,21 @@ int ControlSerializer::serialize(const ControlInfoMap &infoMap,
 		return 0;
 	}
 
+	enum ipa_controls_id_map_type idMapType = idMapTypeFor(infoMap.idmap());
+
 	/* Compute entries and data required sizes. */
 	size_t entriesSize = infoMap.size()
 			   * sizeof(struct ipa_control_info_entry);
 	size_t valuesSize = 0;
-	for (const auto &ctrl : infoMap)
+	for (const auto &ctrl : infoMap) {
 		valuesSize += binarySize(ctrl.second);
-
-	const ControlIdMap *idmap = &infoMap.idmap();
-	enum ipa_controls_id_map_type idMapType;
-	if (idmap == &controls::controls)
-		idMapType = IPA_CONTROL_ID_MAP_CONTROLS;
-	else if (idmap == &properties::properties)
-		idMapType = IPA_CONTROL_ID_MAP_PROPERTIES;
-	else
-		idMapType = IPA_CONTROL_ID_MAP_V4L2;
+		valuesSize += idMapRequiresLocalIds(idMapType)
+				      ? ctrl.first->name().size() + 1
+				      : 1;
+	}
 
 	/* Prepare the packet header. */
-	struct ipa_controls_header hdr;
+	struct ipa_controls_header hdr = {};
 	hdr.version = IPA_CONTROLS_FORMAT_VERSION;
 	hdr.handle = serial_;
 	hdr.entries = infoMap.size();
@@ -267,21 +290,29 @@ int ControlSerializer::serialize(const ControlInfoMap &infoMap,
 	 */
 	serial_ += 2;
 
-	/*
-	 * Serialize all entries.
-	 * \todo Serialize the control name too
-	 */
+	/* Serialize all entries. */
 	ByteStreamBuffer entries = buffer.carveOut(entriesSize);
 	ByteStreamBuffer values = buffer.carveOut(valuesSize);
+	static const std::string emptyName;
 
 	for (const auto &ctrl : infoMap) {
 		const ControlId *id = ctrl.first;
 		const ControlInfo &info = ctrl.second;
+		const std::string &name = idMapRequiresLocalIds(idMapType)
+						  ? id->name()
+						  : emptyName;
 
-		struct ipa_control_info_entry entry;
+		if (name.size() > kMaxControlNameLength) {
+			LOG(Serializer, Error)
+				<< "Control name too long: " << name.size();
+			return -EINVAL;
+		}
+
+		struct ipa_control_info_entry entry = {};
 		entry.id = id->id();
 		entry.type = id->type();
 		entry.direction = static_cast<ControlId::DirectionFlags::Type>(id->direction());
+		entry.name_len = static_cast<uint32_t>(name.size());
 
 		populateControlValueEntry(entry.min, info.min(), values.offset());
 		store(info.min(), values);
@@ -291,6 +322,10 @@ int ControlSerializer::serialize(const ControlInfoMap &infoMap,
 
 		populateControlValueEntry(entry.def, info.def(), values.offset());
 		store(info.def(), values);
+
+		values.write(Span<const uint8_t>(
+			reinterpret_cast<const uint8_t *>(name.c_str()),
+			name.size() + 1));
 
 		entries.write(&entry);
 	}
@@ -355,7 +390,7 @@ int ControlSerializer::serialize(const ControlList &list,
 		valuesSize += binarySize(ctrl.second);
 
 	/* Prepare the packet header. */
-	struct ipa_controls_header hdr;
+	struct ipa_controls_header hdr = {};
 	hdr.version = IPA_CONTROLS_FORMAT_VERSION;
 	hdr.handle = infoMapHandle;
 	hdr.entries = list.size();
@@ -485,25 +520,6 @@ ControlInfoMap ControlSerializer::deserialize<ControlInfoMap>(ByteStreamBuffer &
 
 		ControlType type = static_cast<ControlType>(entry->type);
 
-		/* If we're using a local id map, populate it. */
-		if (localIdMap) {
-			ControlId::DirectionFlags flags{
-				static_cast<ControlId::Direction>(entry->direction)
-			};
-
-			/**
-			 * \todo Find a way to preserve the control name for
-			 * debugging purpose.
-			 */
-			controlIds_.emplace_back(std::make_unique<ControlId>(entry->id,
-									     "", "local", type,
-									     flags));
-			(*localIdMap)[entry->id] = controlIds_.back().get();
-		}
-
-		const ControlId *controlId = idMap->at(entry->id);
-		ASSERT(controlId);
-
 		const ipa_control_value_entry &min_entry = entry->min;
 		const ipa_control_value_entry &max_entry = entry->max;
 		const ipa_control_value_entry &def_entry = entry->def;
@@ -538,6 +554,45 @@ ControlInfoMap ControlSerializer::deserialize<ControlInfoMap>(ByteStreamBuffer &
 			loadControlValue(values, static_cast<ControlType>(def_entry.type),
 					 def_entry.is_array, def_entry.count);
 
+		/*
+		 * Deserialize the null-terminated control name from the values
+		 * section. Reject unreasonably long names to guard against
+		 * malformed packets.
+		 */
+		if (entry->name_len > kMaxControlNameLength) {
+			LOG(Serializer, Error)
+				<< "Control name too long: " << entry->name_len;
+			return {};
+		}
+
+		const auto *nameData = values.read<const uint8_t>(entry->name_len + 1);
+		if (!nameData) {
+			LOG(Serializer, Error) << "Out of data reading control name";
+			return {};
+		}
+
+		if (nameData[entry->name_len] != '\0') {
+			LOG(Serializer, Error) << "Control name is not null-terminated";
+			return {};
+		}
+
+		/* If we're using a local id map, populate it with the restored name. */
+		if (localIdMap) {
+			std::string ctrlName(reinterpret_cast<const char *>(nameData),
+					     entry->name_len);
+
+			ControlId::DirectionFlags flags{
+				static_cast<ControlId::Direction>(entry->direction)
+			};
+
+			controlIds_.emplace_back(std::make_unique<ControlId>(entry->id,
+									     ctrlName, "local",
+									     type, flags));
+			(*localIdMap)[entry->id] = controlIds_.back().get();
+		}
+
+		const ControlId *controlId = idMap->at(entry->id);
+		ASSERT(controlId);
 
 		/* Create and store the ControlInfo. */
 		ctrls.emplace(controlId, ControlInfo(min, max, def));
