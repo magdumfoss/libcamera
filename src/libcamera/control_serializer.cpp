@@ -8,6 +8,7 @@
 #include "libcamera/internal/control_serializer.h"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -48,6 +49,58 @@ enum ipa_controls_id_map_type idMapTypeFor(const ControlIdMap &idmap)
 bool idMapRequiresLocalIds(enum ipa_controls_id_map_type idMapType)
 {
 	return idMapType == IPA_CONTROL_ID_MAP_V4L2;
+}
+
+size_t serializedControlNameSize(const ControlId *id,
+				 enum ipa_controls_id_map_type idMapType)
+{
+	return idMapRequiresLocalIds(idMapType) ? id->name().size() + 1 : 1;
+}
+
+bool fitsU32(size_t value)
+{
+	return value <= std::numeric_limits<uint32_t>::max();
+}
+
+bool safeMulSizeT(size_t lhs, size_t rhs, size_t *out)
+{
+	if (!lhs || !rhs) {
+		*out = 0;
+		return true;
+	}
+
+	if (lhs > std::numeric_limits<size_t>::max() / rhs)
+		return false;
+
+	*out = lhs * rhs;
+	return true;
+}
+
+bool safeAddSizeT(size_t lhs, size_t rhs, size_t *out)
+{
+	if (lhs > std::numeric_limits<size_t>::max() - rhs)
+		return false;
+
+	*out = lhs + rhs;
+	return true;
+}
+
+bool isValidDirection(uint8_t direction)
+{
+	constexpr uint8_t kDirectionIn =
+		static_cast<uint8_t>(ControlId::Direction::In);
+	constexpr uint8_t kDirectionOut =
+		static_cast<uint8_t>(ControlId::Direction::Out);
+	constexpr uint8_t kDirectionInOut = kDirectionIn | kDirectionOut;
+
+	switch (direction) {
+	case kDirectionIn:
+	case kDirectionOut:
+	case kDirectionInOut:
+		return true;
+	default:
+		return false;
+	}
 }
 
 } /* namespace */
@@ -184,16 +237,26 @@ size_t ControlSerializer::binarySize(const ControlInfo &info)
  */
 size_t ControlSerializer::binarySize(const ControlInfoMap &infoMap)
 {
-	size_t size = sizeof(struct ipa_controls_header)
-		    + infoMap.size() * sizeof(struct ipa_control_info_entry);
+	size_t entriesSize;
+	if (!safeMulSizeT(infoMap.size(), sizeof(struct ipa_control_info_entry),
+			  &entriesSize))
+		return std::numeric_limits<size_t>::max();
+
+	size_t size;
+	if (!safeAddSizeT(sizeof(struct ipa_controls_header), entriesSize, &size))
+		return std::numeric_limits<size_t>::max();
 	enum ipa_controls_id_map_type idMapType = idMapTypeFor(infoMap.idmap());
 
 	for (const auto &ctrl : infoMap) {
-		size += binarySize(ctrl.second);
+		size_t nextSize;
+		if (!safeAddSizeT(size, binarySize(ctrl.second), &nextSize))
+			return std::numeric_limits<size_t>::max();
+		size = nextSize;
 
-		size += idMapRequiresLocalIds(idMapType)
-				? ctrl.first->name().size() + 1
-				: 1;
+		size_t nameSize = serializedControlNameSize(ctrl.first, idMapType);
+		if (!safeAddSizeT(size, nameSize, &nextSize))
+			return std::numeric_limits<size_t>::max();
+		size = nextSize;
 	}
 
 	return size;
@@ -210,10 +273,21 @@ size_t ControlSerializer::binarySize(const ControlInfoMap &infoMap)
  */
 size_t ControlSerializer::binarySize(const ControlList &list)
 {
-	size_t size = sizeof(struct ipa_controls_header) + list.size() * sizeof(struct ipa_control_list_entry);
+	size_t entriesSize;
+	if (!safeMulSizeT(list.size(), sizeof(struct ipa_control_list_entry),
+			  &entriesSize))
+		return std::numeric_limits<size_t>::max();
 
-	for (const auto &ctrl : list)
-		size += binarySize(ctrl.second);
+	size_t size;
+	if (!safeAddSizeT(sizeof(struct ipa_controls_header), entriesSize, &size))
+		return std::numeric_limits<size_t>::max();
+
+	for (const auto &ctrl : list) {
+		size_t nextSize;
+		if (!safeAddSizeT(size, binarySize(ctrl.second), &nextSize))
+			return std::numeric_limits<size_t>::max();
+		size = nextSize;
+	}
 
 	return size;
 }
@@ -260,23 +334,70 @@ int ControlSerializer::serialize(const ControlInfoMap &infoMap,
 	enum ipa_controls_id_map_type idMapType = idMapTypeFor(infoMap.idmap());
 
 	/* Compute entries and data required sizes. */
-	size_t entriesSize = infoMap.size()
-			   * sizeof(struct ipa_control_info_entry);
+	size_t entriesSize;
+	if (!safeMulSizeT(infoMap.size(), sizeof(struct ipa_control_info_entry),
+			  &entriesSize)) {
+		LOG(Serializer, Error)
+			<< "ControlInfoMap entries size overflows";
+		return -E2BIG;
+	}
+
 	size_t valuesSize = 0;
 	for (const auto &ctrl : infoMap) {
-		valuesSize += binarySize(ctrl.second);
-		valuesSize += idMapRequiresLocalIds(idMapType)
-				      ? ctrl.first->name().size() + 1
-				      : 1;
+		size_t valueSize = binarySize(ctrl.second);
+		size_t nextValuesSize;
+		if (!safeAddSizeT(valuesSize, valueSize, &nextValuesSize)) {
+			LOG(Serializer, Error)
+				<< "ControlInfoMap values size overflows";
+			return -E2BIG;
+		}
+		valuesSize = nextValuesSize;
+
+		size_t nameSize = serializedControlNameSize(ctrl.first, idMapType);
+		if (!safeAddSizeT(valuesSize, nameSize, &nextValuesSize)) {
+			LOG(Serializer, Error)
+				<< "ControlInfoMap names size overflows";
+			return -E2BIG;
+		}
+		valuesSize = nextValuesSize;
+	}
+
+	if (!fitsU32(infoMap.size()) || !fitsU32(entriesSize) ||
+	    !fitsU32(valuesSize)) {
+		LOG(Serializer, Error)
+			<< "ControlInfoMap serialization size exceeds wire limits";
+		return -E2BIG;
+	}
+
+	size_t totalSize;
+	if (!safeAddSizeT(sizeof(struct ipa_controls_header), entriesSize,
+			  &totalSize) ||
+	    !safeAddSizeT(totalSize, valuesSize, &totalSize)) {
+		LOG(Serializer, Error)
+			<< "ControlInfoMap packet size overflows";
+		return -E2BIG;
+	}
+
+	size_t dataOffset;
+	if (!safeAddSizeT(sizeof(struct ipa_controls_header), entriesSize,
+			  &dataOffset)) {
+		LOG(Serializer, Error)
+			<< "ControlInfoMap data offset overflows";
+		return -E2BIG;
+	}
+	if (!fitsU32(totalSize) || !fitsU32(dataOffset)) {
+		LOG(Serializer, Error)
+			<< "ControlInfoMap packet header exceeds wire limits";
+		return -E2BIG;
 	}
 
 	/* Prepare the packet header. */
 	struct ipa_controls_header hdr = {};
 	hdr.version = IPA_CONTROLS_FORMAT_VERSION;
 	hdr.handle = serial_;
-	hdr.entries = infoMap.size();
-	hdr.size = sizeof(hdr) + entriesSize + valuesSize;
-	hdr.data_offset = sizeof(hdr) + entriesSize;
+	hdr.entries = static_cast<uint32_t>(infoMap.size());
+	hdr.size = static_cast<uint32_t>(totalSize);
+	hdr.data_offset = static_cast<uint32_t>(dataOffset);
 	hdr.id_map_type = idMapType;
 
 	buffer.write(&hdr);
@@ -384,18 +505,62 @@ int ControlSerializer::serialize(const ControlList &list,
 	else
 		idMapType = IPA_CONTROL_ID_MAP_V4L2;
 
-	size_t entriesSize = list.size() * sizeof(struct ipa_control_list_entry);
+	size_t entriesSize;
+	if (!safeMulSizeT(list.size(), sizeof(struct ipa_control_list_entry),
+			  &entriesSize)) {
+		LOG(Serializer, Error)
+			<< "ControlList entries size overflows";
+		return -E2BIG;
+	}
+
 	size_t valuesSize = 0;
-	for (const auto &ctrl : list)
-		valuesSize += binarySize(ctrl.second);
+	for (const auto &ctrl : list) {
+		size_t nextValuesSize;
+		if (!safeAddSizeT(valuesSize, binarySize(ctrl.second),
+				  &nextValuesSize)) {
+			LOG(Serializer, Error)
+				<< "ControlList values size overflows";
+			return -E2BIG;
+		}
+		valuesSize = nextValuesSize;
+	}
+
+	if (!fitsU32(list.size()) || !fitsU32(entriesSize) ||
+	    !fitsU32(valuesSize)) {
+		LOG(Serializer, Error)
+			<< "ControlList serialization size exceeds wire limits";
+		return -E2BIG;
+	}
+
+	size_t totalSize;
+	if (!safeAddSizeT(sizeof(struct ipa_controls_header), entriesSize,
+			  &totalSize) ||
+	    !safeAddSizeT(totalSize, valuesSize, &totalSize)) {
+		LOG(Serializer, Error)
+			<< "ControlList packet size overflows";
+		return -E2BIG;
+	}
+
+	size_t dataOffset;
+	if (!safeAddSizeT(sizeof(struct ipa_controls_header), entriesSize,
+			  &dataOffset)) {
+		LOG(Serializer, Error)
+			<< "ControlList data offset overflows";
+		return -E2BIG;
+	}
+	if (!fitsU32(totalSize) || !fitsU32(dataOffset)) {
+		LOG(Serializer, Error)
+			<< "ControlList packet header exceeds wire limits";
+		return -E2BIG;
+	}
 
 	/* Prepare the packet header. */
 	struct ipa_controls_header hdr = {};
 	hdr.version = IPA_CONTROLS_FORMAT_VERSION;
 	hdr.handle = infoMapHandle;
-	hdr.entries = list.size();
-	hdr.size = sizeof(hdr) + entriesSize + valuesSize;
-	hdr.data_offset = sizeof(hdr) + entriesSize;
+	hdr.entries = static_cast<uint32_t>(list.size());
+	hdr.size = static_cast<uint32_t>(totalSize);
+	hdr.data_offset = static_cast<uint32_t>(dataOffset);
 	hdr.id_map_type = idMapType;
 
 	buffer.write(&hdr);
@@ -578,6 +743,13 @@ ControlInfoMap ControlSerializer::deserialize<ControlInfoMap>(ByteStreamBuffer &
 
 		/* If we're using a local id map, populate it with the restored name. */
 		if (localIdMap) {
+			if (!isValidDirection(entry->direction)) {
+				LOG(Serializer, Error)
+					<< "Control direction is invalid: "
+					<< static_cast<unsigned int>(entry->direction);
+				return {};
+			}
+
 			std::string ctrlName(reinterpret_cast<const char *>(nameData),
 					     entry->name_len);
 

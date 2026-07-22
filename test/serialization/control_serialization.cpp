@@ -6,6 +6,7 @@
  */
 
 #include <iostream>
+#include <string.h>
 
 #include <libcamera/camera.h>
 #include <libcamera/control_ids.h>
@@ -224,11 +225,13 @@ protected:
 
 		/* Reject malformed packets with over-sized names. */
 		vector<uint8_t> badNameLenData = infoData;
-		auto *badNameLenHeader =
-			reinterpret_cast<ipa_controls_header *>(badNameLenData.data());
-		auto *badNameLenEntry = reinterpret_cast<ipa_control_info_entry *>(
-			badNameLenData.data() + sizeof(*badNameLenHeader));
-		badNameLenEntry->name_len = 2048;
+		ipa_control_info_entry badNameLenEntry;
+		std::memcpy(&badNameLenEntry,
+			    badNameLenData.data() + sizeof(ipa_controls_header),
+			    sizeof(badNameLenEntry));
+		badNameLenEntry.name_len = 2048;
+		std::memcpy(badNameLenData.data() + sizeof(ipa_controls_header),
+			    &badNameLenEntry, sizeof(badNameLenEntry));
 
 		ControlSerializer badNameLenDeserializer(ControlSerializer::Role::Worker);
 		buffer = ByteStreamBuffer(const_cast<const uint8_t *>(badNameLenData.data()),
@@ -240,7 +243,30 @@ protected:
 
 		/* Reject malformed packets with non-null-terminated names. */
 		vector<uint8_t> badTermData = infoData;
-		badTermData.back() = 'X';
+		ipa_controls_header badTermHeader;
+		ipa_control_info_entry badTermEntry;
+		std::memcpy(&badTermHeader, badTermData.data(), sizeof(badTermHeader));
+		std::memcpy(&badTermEntry,
+			    badTermData.data() + sizeof(ipa_controls_header),
+			    sizeof(badTermEntry));
+
+		if (badTermEntry.id != kV4L2TestControlId ||
+		    badTermEntry.type != ControlTypeInteger32 ||
+		    badTermEntry.def.type != ControlTypeInteger32 ||
+		    badTermEntry.def.is_array || badTermEntry.def.count != 1 ||
+		    badTermEntry.name_len != kV4L2ControlName.size()) {
+			cerr << "Malformed test packet layout for bad terminator test" << endl;
+			return TestFail;
+		}
+
+		size_t nameStart = badTermHeader.data_offset + badTermEntry.def.offset +
+				   sizeof(int32_t);
+		size_t termOffset = nameStart + badTermEntry.name_len;
+		if (termOffset >= badTermData.size()) {
+			cerr << "Malformed test packet while preparing bad terminator" << endl;
+			return TestFail;
+		}
+		badTermData[termOffset] = 'X';
 
 		ControlSerializer badTermDeserializer(ControlSerializer::Role::Worker);
 		buffer = ByteStreamBuffer(const_cast<const uint8_t *>(badTermData.data()),
@@ -275,6 +301,45 @@ protected:
 		ret = longNameSerializer.serialize(longNameInfoMap, buffer);
 		if (ret != -EINVAL) {
 			cerr << "Too-long control name should fail serialization" << endl;
+			return TestFail;
+		}
+
+		/* Accept names at the configured length limit. */
+		vector<unique_ptr<ControlId>> maxNameControlIds;
+		ControlIdMap maxNameIdMap;
+		string maxName(1024, 'm');
+
+		maxNameControlIds.emplace_back(std::make_unique<ControlId>(
+			0x009a2003, maxName, "v4l2", ControlTypeInteger32,
+			ControlId::Direction::In));
+		maxNameIdMap.emplace(0x009a2003, maxNameControlIds.back().get());
+
+		ControlInfoMap::Map maxNameInfo;
+		maxNameInfo.emplace(maxNameControlIds.back().get(),
+				    ControlInfo(ControlValue(int32_t{ 0 }),
+						ControlValue(int32_t{ 255 }),
+						ControlValue(int32_t{ 16 })));
+		ControlSerializer maxNameSerializer(ControlSerializer::Role::Proxy);
+		ControlSerializer maxNameDeserializer(ControlSerializer::Role::Worker);
+
+		size = maxNameSerializer.binarySize(maxNameInfoMap);
+		infoData.resize(size);
+		buffer = ByteStreamBuffer(infoData.data(), infoData.size());
+
+		ret = maxNameSerializer.serialize(maxNameInfoMap, buffer);
+		if (ret < 0 || buffer.overflow()) {
+			cerr << "Max-length control name should serialize successfully" << endl;
+			return TestFail;
+		}
+
+		buffer = ByteStreamBuffer(const_cast<const uint8_t *>(infoData.data()),
+					  infoData.size());
+		ControlInfoMap maxNameInfoMapDes =
+			maxNameDeserializer.deserialize<ControlInfoMap>(buffer);
+		auto maxNameIdIt = maxNameInfoMapDes.idmap().find(0x009a2003);
+		if (maxNameIdIt == maxNameInfoMapDes.idmap().end() ||
+		    maxNameIdIt->second->name() != maxName) {
+			cerr << "Max-length control name round-trip failed" << endl;
 			return TestFail;
 		}
 
